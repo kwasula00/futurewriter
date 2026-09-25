@@ -1,8 +1,23 @@
-import type { StoryBible, ContinuityEntry, LanguagePolicy } from "./schemas";
+import type { StoryBible, ContinuityEntry, LanguagePolicy, SceneTemplate } from "./schemas";
 
 export interface CompiledContext {
   systemPrompt: string;
   sceneContext: string;
+}
+
+export interface CompileOptions {
+  /**
+   * Every scene id, in the order the Story Diagram's green links place them. The
+   * outline is written in this order, so the model is told where the scene it is
+   * writing sits in the plot. Left out, the scenes are read in World → Scenes
+   * order instead.
+   */
+  sceneOrder?: string[];
+  /**
+   * Set when the writer has already been sent a draft and is now asking for a
+   * change, so the scene is rewritten rather than begun.
+   */
+  revising?: boolean;
 }
 
 /**
@@ -36,6 +51,7 @@ export function compileStoryContext(
   bible: StoryBible,
   sceneId: string,
   previousScenes: ContinuityEntry[],
+  options: CompileOptions = {},
 ): CompiledContext {
   const scene = bible.scenes.find((s) => s.id === sceneId);
   if (!scene) throw new Error(`Scene ${sceneId} not found`);
@@ -54,6 +70,12 @@ export function compileStoryContext(
 You are a narrator and co-author of a novel. Generate text STRICTLY according
 to the WORLD BIBLE and NARRATIVE RULES below. Do not change facts,
 relationships, or character traits without explicit consent.
+
+The STORY OUTLINE lists every scene of the story in order. The one marked
+"THIS SCENE" is the scene being written: what comes before it has already
+happened and must not be contradicted, and what comes after it must still be
+possible when this scene ends. End the scene on the consequence its plan calls
+for.
 
 ## HARD WORLD RULES (never violate)
 ${hardRules || "(none)"}
@@ -81,7 +103,9 @@ Return ONLY a JSON object with this shape:
   ],
   "newElementsIntroduced": ["new element"]
 }
-No text outside the JSON.
+No text outside the JSON. When a draft has already been sent and the writer is
+now asking for a change, return the WHOLE scene again in this shape — revised as
+asked, not only the lines that changed.
 `.trim();
 
   const sceneCharacters = bible.characters.filter((c) =>
@@ -125,6 +149,27 @@ ${c.secret ? `- SECRET (do not reveal explicitly): ${c.secret}` : ""}
     .map((f) => `- ${f}`)
     .join("\n");
 
+  // Where this scene sits in the story. The Story Diagram's green links put the
+  // scenes in order, so the writer's own map is read back as the plot: every
+  // scene with what it sets out to do and what it leaves behind, and the one
+  // being written marked. The model then knows what has already happened and
+  // what this scene has to set up — not only what happens inside it.
+  const order = options.sceneOrder?.length
+    ? options.sceneOrder
+    : bible.scenes.map((candidate) => candidate.id);
+  const outline = order
+    .map((id) => bible.scenes.find((candidate) => candidate.id === id))
+    .filter((candidate): candidate is SceneTemplate => candidate !== undefined)
+    .map((candidate, index) => {
+      const mark = candidate.id === sceneId ? "  <- THIS SCENE" : "";
+      return `${index + 1}. ${candidate.title.trim() || "(untitled scene)"}${mark}
+   Goal: ${candidate.goal || "(none)"}
+   Conflict: ${candidate.conflict || "(none)"}
+   Turning point: ${candidate.turningPoint || "(none)"}
+   Consequence: ${candidate.consequence || "(none)"}`;
+    })
+    .join("\n");
+
   const sceneContext = `
 ## CHARACTERS IN THIS SCENE
 ${characterBlock || "(none)"}
@@ -141,11 +186,21 @@ ${relationships || "(none)"}
 - Turning point: ${scene.turningPoint}
 - Consequence: ${scene.consequence}
 
+## STORY OUTLINE (every scene, in story order)
+${outline || "(none)"}
+
 ## PREVIOUS SCENES SUMMARY
 ${recentSummary || "(none - first scene)"}
 
 ## ESTABLISHED FACTS (do not contradict)
 ${allFacts || "(none)"}
+
+## TASK
+${
+  options.revising
+    ? "The writer's instructions follow. Rewrite the whole scene to carry them out, keeping everything else that was already right."
+    : "Write the scene described above, in full."
+}
 `.trim();
 
   return { systemPrompt, sceneContext };

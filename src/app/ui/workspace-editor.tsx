@@ -1704,11 +1704,12 @@ export function WorkspaceEditor({
         {diagramOpen && (
           <StoryDiagram
             projectId={project.id}
-            characters={bible.characters}
-            scenes={bible.scenes}
+            bible={bible}
             onCreateScene={(scene) =>
               setBible((current) => ({ ...current, scenes: [...current.scenes, scene] }))
             }
+            onInsertToDraft={(text) => insertIntoDraft(text)}
+            onApplyContinuity={(next) => setBible(next)}
             onClose={closeDiagram}
           />
         )}

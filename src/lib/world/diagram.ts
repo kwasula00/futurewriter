@@ -131,6 +131,11 @@ export const StoredDiagramEdgeSchema = z.object({
   id: z.string(),
   source: z.string(),
   target: z.string(),
+  // Which port each end was joined to. A scene offers several around its rim,
+  // so a character keeps the one it was taken in by; absent on a link drawn to
+  // a single-port card, which has nothing to tell apart.
+  sourceHandle: z.string().optional(),
+  targetHandle: z.string().optional(),
   // Which interaction of the library this link is. Absent on a link drawn
   // before interactions existed, and on one drawn with none chosen.
   interactionId: z.string().optional(),
@@ -213,6 +218,31 @@ export function interactionEdgeStyle(interaction?: Interaction): Partial<StoryFl
   };
 }
 
+/**
+ * The green a membership link is drawn in — the colour of the scene it points
+ * at, so a glance tells which scenes have taken whom in.
+ */
+export const SCENE_MEMBERSHIP_COLOR = "#10b981";
+
+/**
+ * How a link that ends at a scene is drawn: the scene's green, with the arrow
+ * pointing at the scene. Such a link is not an interaction but a membership —
+ * the character on its other end belongs to that scene — so it is inked apart
+ * from the interaction colours, whatever interaction it may also name.
+ */
+export function sceneMembershipStyle(): Partial<StoryFlowEdge> {
+  return {
+    type: "smoothstep",
+    style: { stroke: SCENE_MEMBERSHIP_COLOR, strokeWidth: 1.5 },
+    markerEnd: {
+      type: MarkerType.ArrowClosed,
+      color: SCENE_MEMBERSHIP_COLOR,
+      width: 14,
+      height: 14,
+    },
+  };
+}
+
 /** A stored diagram turned into the cards and arrows the canvas draws. */
 export function toFlowNodes(stored: StoredDiagramNode[]): StoryFlowNode[] {
   return stored.map((node) => ({
@@ -234,6 +264,8 @@ export function toFlowEdges(stored: StoredDiagramEdge[]): StoryFlowEdge[] {
     id: edge.id,
     source: edge.source,
     target: edge.target,
+    sourceHandle: edge.sourceHandle,
+    targetHandle: edge.targetHandle,
     data: { interactionId: edge.interactionId },
   }));
 }
@@ -260,12 +292,73 @@ export function toStoredEdges(edges: StoryFlowEdge[]): StoredDiagramEdge[] {
     id: edge.id,
     source: edge.source,
     target: edge.target,
+    sourceHandle: edge.sourceHandle ?? undefined,
+    targetHandle: edge.targetHandle ?? undefined,
     interactionId: edge.data?.interactionId,
   }));
 }
 
 /** Every card is the same width, so the columns of the layout line up. */
 const NODE_WIDTH = 216;
+
+/**
+ * The circle a scene is drawn as. A scene is smaller than a card, so the map
+ * reads as the things the characters gather around rather than as one more
+ * rectangle — the layout is told its size apart from a card's.
+ */
+export const SCENE_NODE_SIZE = 96;
+
+/**
+ * The ports a scene offers around its rim. A scene is where a cast gathers, so
+ * it is joined at more than one place — each character taken in has a port of
+ * its own rather than every link crowding the single spot a card has. The
+ * count is shared by the canvas, which draws them, and the layout, which hands
+ * each member a different one.
+ */
+export const SCENE_PORT_COUNT = 8;
+
+/** The port a scene offers, by its place around the rim. */
+export function scenePortId(index: number): string {
+  return `scene-in-${index}`;
+}
+
+/**
+ * The green port a character leaves from when it is taken into a scene. It is
+ * the card's only way into a scene, kept apart from the port its other links —
+ * the ties it has to other cards — leave by. A link that ends at a scene is
+ * begun here and nowhere else.
+ */
+export const SCENE_OUT_PORT_ID = "scene-out";
+
+/**
+ * The green ports a scene leaves from when it leads on to another scene. There
+ * are two, so a scene can be drawn to one or two scenes of its own.
+ */
+export const SCENE_OUT_PORT_COUNT = 2;
+
+/** A scene's outgoing port, by its place around the rim. */
+export function sceneOutPortId(index: number): string {
+  return `scene-out-${index}`;
+}
+
+/**
+ * The port that lies over a scene's outgoing port and takes a link in there.
+ * React Flow will not let one port be both left from and arrived at, so each
+ * green port is drawn twice: the green one is left from, this one is arrived
+ * at. A scene can therefore be led on to at the very spot it leads on from.
+ */
+export function sceneOutTargetPortId(index: number): string {
+  return `scene-out-in-${index}`;
+}
+
+/**
+ * Whether a source port is one that leads into a scene — the green port a
+ * character is taken in by, or one of the green ports a scene leads on by. Such
+ * a port is joined to a scene and to nothing else.
+ */
+export function isSceneBoundPort(handleId: string | null | undefined): boolean {
+  return handleId === SCENE_OUT_PORT_ID || (handleId?.startsWith("scene-out-") ?? false);
+}
 
 /** Detail rows a card shows before it is cut off — the panel holds the rest. */
 const MAX_DETAIL_LINES = 3;
@@ -282,7 +375,6 @@ const RELATIONSHIP_COLOR: Record<Relationship["type"], string> = {
   debt: "#64748b",
 };
 
-const SCENE_LINK_COLOR = "#94a3b8";
 const CITES_LINK_COLOR = "#d97706";
 
 /**
@@ -295,6 +387,18 @@ function cardHeight(data: StoryNodeData): number {
   if (data.subtitle) height += 14;
   if (rows > 0) height += 10 + rows * 15;
   return height;
+}
+
+/**
+ * How wide and tall a node will be drawn. A scene is a small circle and every
+ * other kind a card, so the layout is given a box per kind rather than one size
+ * for the whole map.
+ */
+function nodeBox(node: StoryFlowNode): { width: number; height: number } {
+  if (node.data.kind === "scene") {
+    return { width: SCENE_NODE_SIZE, height: SCENE_NODE_SIZE };
+  }
+  return { width: NODE_WIDTH, height: cardHeight(node.data) };
 }
 
 /** Rows of small print, keeping only the ones the writer actually filled in. */
@@ -377,6 +481,62 @@ export function resolveScene(data: StoryNodeData, scenes: SceneTemplate[]): Stor
   return scene ? { ...data, ...sceneCard(scene) } : data;
 }
 
+/**
+ * The scenes of the story in the order the map puts them in. A scene is led on
+ * from its green ports to the scene that follows it, so those links are read as
+ * the order of the story: the scene nothing leads to opens it, then whatever
+ * that scene leads on to, and so on. A scene no link reaches — one never put on
+ * the map, or one whose link was taken away — keeps its place in World →
+ * Scenes, so the list always holds every scene: the map orders what it can and
+ * the panel carries the rest.
+ */
+export function orderSceneIds(
+  flowNodes: StoryFlowNode[],
+  flowEdges: StoryFlowEdge[],
+  scenes: SceneTemplate[],
+): string[] {
+  const known = new Set(scenes.map((scene) => scene.id));
+  // A scene can be put down more than once, so the cards are gathered back to
+  // the one scene they all stand for.
+  const sceneOfNode = new Map<string, string>();
+  for (const node of flowNodes) {
+    if (node.data.kind === "scene" && node.data.sceneId && known.has(node.data.sceneId)) {
+      sceneOfNode.set(node.id, node.data.sceneId);
+    }
+  }
+
+  // What follows what, read from the green links drawn between scenes.
+  const next = new Map<string, string[]>();
+  const reached = new Set<string>();
+  for (const edge of flowEdges) {
+    if (!isSceneBoundPort(edge.sourceHandle)) continue;
+    const from = sceneOfNode.get(edge.source);
+    const to = sceneOfNode.get(edge.target);
+    if (!from || !to || from === to) continue;
+    const list = next.get(from);
+    if (list) {
+      if (!list.includes(to)) list.push(to);
+    } else {
+      next.set(from, [to]);
+    }
+    reached.add(to);
+  }
+
+  const order: string[] = [];
+  const seen = new Set<string>();
+  const visit = (id: string) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    order.push(id);
+    for (const child of next.get(id) ?? []) visit(child);
+  };
+
+  for (const scene of scenes) if (!reached.has(scene.id)) visit(scene.id);
+  for (const scene of scenes) visit(scene.id);
+
+  return order;
+}
+
 /** The words a character can be recognised by inside a rule: name and aliases. */
 function callNames(character: Character): string[] {
   return [character.name, ...(character.aliases ?? [])].filter((word) => word.trim() !== "");
@@ -430,17 +590,20 @@ export function buildStoryGraph(bible: StoryBible): {
 
     // A scene holds as many characters as the writer put in it, and a character
     // sits in as many scenes as they appear in, so these links cross freely.
-    for (const characterId of scene.characterIds) {
-      if (!knownCharacters.has(characterId)) continue;
+    // Each is a membership link: the character belongs to the scene, so the
+    // arrow runs from the character to the scene it was taken into, and each
+    // member joins at a port of its own so a full cast does not pile onto one
+    // spot of the rim.
+    scene.characterIds.forEach((characterId, index) => {
+      if (!knownCharacters.has(characterId)) return;
       edges.push({
-        id: `scene:${scene.id}->${characterId}`,
-        source: `scene:${scene.id}`,
-        target: `character:${characterId}`,
-        type: "smoothstep",
-        style: { stroke: SCENE_LINK_COLOR, strokeWidth: 1, strokeDasharray: "4 3" },
-        markerEnd: { type: MarkerType.ArrowClosed, color: SCENE_LINK_COLOR, width: 12, height: 12 },
+        id: `character:${characterId}->scene:${scene.id}`,
+        source: `character:${characterId}`,
+        target: `scene:${scene.id}`,
+        targetHandle: scenePortId(index % SCENE_PORT_COUNT),
+        ...sceneMembershipStyle(),
       });
-    }
+    });
   }
 
   for (const rule of bible.worldHardRules) {
@@ -521,9 +684,9 @@ function linkCited(
 }
 
 /**
- * Places the cards. Scenes are ranked left of the characters they hold and the
- * rules they meet right of them, so the map reads left to right the way the
- * story is planned: scene → who is in it → what they must obey.
+ * Places the cards. A rule cites the characters it names and a character is
+ * taken into the scene it belongs to, so the map reads left to right the way
+ * the story is built: what must be obeyed → who it binds → where they gather.
  */
 function layout(nodes: StoryFlowNode[], edges: StoryFlowEdge[]): {
   nodes: StoryFlowNode[];
@@ -534,7 +697,8 @@ function layout(nodes: StoryFlowNode[], edges: StoryFlowEdge[]): {
   graph.setDefaultEdgeLabel(() => ({}));
 
   for (const node of nodes) {
-    graph.setNode(node.id, { width: NODE_WIDTH, height: cardHeight(node.data) });
+    const box = nodeBox(node);
+    graph.setNode(node.id, { width: box.width, height: box.height });
   }
   for (const edge of edges) {
     if (graph.hasNode(edge.source) && graph.hasNode(edge.target)) {
@@ -546,13 +710,13 @@ function layout(nodes: StoryFlowNode[], edges: StoryFlowEdge[]): {
 
   return {
     nodes: nodes.map((node) => {
-      const height = cardHeight(node.data);
+      const box = nodeBox(node);
       const center = graph.node(node.id);
       return {
         ...node,
-        width: NODE_WIDTH,
-        height,
-        position: { x: center.x - NODE_WIDTH / 2, y: center.y - height / 2 },
+        width: box.width,
+        height: box.height,
+        position: { x: center.x - box.width / 2, y: center.y - box.height / 2 },
       };
     }),
     edges,
