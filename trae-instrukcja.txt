@@ -1,0 +1,1604 @@
+================================================================================
+TRAE SOLO — ZADANIE: INTEGRACJA WORLD PANEL Z FUTUREWRITER
+================================================================================
+
+CEL
+---
+Dodać do istniejącej aplikacji FutureWriter (Next.js + Supabase + własny
+contentEditable editor + czat SSE przez OpenRouter z modelem
+"deepseek/deepseek-v4.1-flash" by Relace) trzy zakładki w prawym panelu:
+
+  [ chat ] [ world ] [ scene ]
+
+- chat  — istniejący czat, BEZ ZMIAN
+- world — CRUD: hard rules, soft rules, characters, relationships, narrative
+- scene — plan sceny + generowanie przez DeepSeek + walidacja + accept do draftu
+
+ZASADY
+------
+1. NIE przepisuj istniejącego kodu. Tylko dodaj nowe pliki i wstaw 6 małych
+   fragmentów w src/components/workspace-editor.tsx.
+2. Wszystkie dane świata trzymane w Supabase (tabela story_bibles, JSONB).
+3. Zod waliduje wszystko: panel, wynik modelu, zapis do bazy.
+4. Model NIE zmienia świata sam. Proponuje zmiany, pisarz akceptuje.
+5. insertIntoDraft (już istnieje w workspace-editor.tsx) używamy ponownie.
+
+================================================================================
+KROK 1 — SQL W SUPABASE (wykonaj ręcznie w SQL Editor)
+================================================================================
+
+create table if not exists story_bibles (
+  id uuid primary key default gen_random_uuid(),
+  project_id uuid not null references projects(id) on delete cascade,
+  bible jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now(),
+  unique (project_id)
+);
+
+alter table story_bibles enable row level security;
+
+drop policy if exists "owner can read" on story_bibles;
+drop policy if exists "owner can write" on story_bibles;
+
+create policy "owner can read"
+  on story_bibles for select
+  using (exists (
+    select 1 from projects p
+    where p.id = story_bibles.project_id
+      and p.user_id = auth.uid()
+  ));
+
+create policy "owner can write"
+  on story_bibles for all
+  using (exists (
+    select 1 from projects p
+    where p.id = story_bibles.project_id
+      and p.user_id = auth.uid()
+  ));
+
+Jeśli tabela projects nie ma kolumny user_id — dostosuj politykę.
+
+================================================================================
+KROK 2 — PLIKI DO UTWORZENIA (8 plików)
+================================================================================
+
+--------------------------------------------------------------------------------
+PLIK 1: src/lib/world/schemas.ts
+--------------------------------------------------------------------------------
+
+import { z } from "zod";
+
+export const HardRuleSchema = z.object({
+  id: z.string(),
+  category: z.enum(["physics", "magic", "social", "timeline", "geography"]),
+  rule: z.string().min(1),
+  violationConsequence: z.string().min(1),
+});
+
+export const SoftRuleSchema = z.object({
+  id: z.string(),
+  rule: z.string().min(1),
+  conditions: z.array(z.string()).optional(),
+});
+
+export const CharacterSchema = z.object({
+  id: z.string(),
+  name: z.string().min(1),
+  aliases: z.array(z.string()).optional(),
+  age: z.number().optional(),
+  appearance: z.string(),
+  traits: z.array(z.string()).min(1),
+  motivation: z.string().min(1),
+  fear: z.string().min(1),
+  secret: z.string().optional(),
+  speechStyle: z.string().min(1),
+  arc: z.object({ from: z.string(), to: z.string() }).optional(),
+});
+
+export const RelationshipSchema = z.object({
+  fromId: z.string(),
+  toId: z.string(),
+  type: z.enum([
+    "love", "hate", "friend", "rival",
+    "family", "mentor", "betrayal", "debt",
+  ]),
+  intensity: z.number().min(1).max(10),
+  history: z.string(),
+  currentState: z.string(),
+});
+
+export const NarrativeRulesSchema = z.object({
+  pov: z.enum(["first", "third_limited", "third_omniscient"]),
+  tense: z.enum(["past", "present"]),
+  tone: z.string().min(1),
+  pacing: z.enum(["slow", "medium", "fast"]),
+  sceneLengthWords: z.object({ min: z.number(), max: z.number() }),
+  dialogueRatio: z.number().min(0).max(1),
+  showDontTell: z.boolean().default(true),
+  forbiddenTropes: z.array(z.string()),
+});
+
+export const SceneTemplateSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  goal: z.string(),
+  location: z.string(),
+  time: z.string(),
+  characterIds: z.array(z.string()),
+  conflict: z.string(),
+  turningPoint: z.string(),
+  consequence: z.string(),
+  status: z.enum(["planned", "drafted", "revised", "done"]),
+});
+
+export const ContinuityEntrySchema = z.object({
+  sceneId: z.string(),
+  summary: z.string(),
+  facts: z.array(z.string()),
+  relationshipChanges: z.array(z.object({
+    from: z.string(), to: z.string(),
+    newState: z.string(), reason: z.string(),
+  })),
+  newElements: z.array(z.string()),
+  timestamp: z.number(),
+});
+
+export const StoryBibleSchema = z.object({
+  version: z.number().default(1),
+  worldHardRules: z.array(HardRuleSchema),
+  worldSoftRules: z.array(SoftRuleSchema),
+  characters: z.array(CharacterSchema),
+  relationships: z.array(RelationshipSchema),
+  narrativeRules: NarrativeRulesSchema,
+  scenes: z.array(SceneTemplateSchema),
+  continuityLog: z.array(ContinuityEntrySchema),
+});
+
+export type HardRule = z.infer<typeof HardRuleSchema>;
+export type SoftRule = z.infer<typeof SoftRuleSchema>;
+export type Character = z.infer<typeof CharacterSchema>;
+export type Relationship = z.infer<typeof RelationshipSchema>;
+export type NarrativeRules = z.infer<typeof NarrativeRulesSchema>;
+export type SceneTemplate = z.infer<typeof SceneTemplateSchema>;
+export type ContinuityEntry = z.infer<typeof ContinuityEntrySchema>;
+export type StoryBible = z.infer<typeof StoryBibleSchema>;
+
+export const SceneOutputSchema = z.object({
+  prose: z.string().min(1),
+  factsEstablished: z.array(z.string()),
+  relationshipChanges: z.array(z.object({
+    from: z.string(), to: z.string(),
+    newState: z.string(), reason: z.string(),
+  })),
+  newElementsIntroduced: z.array(z.string()),
+});
+export type SceneOutput = z.infer<typeof SceneOutputSchema>;
+
+export const emptyBible: StoryBible = {
+  version: 1,
+  worldHardRules: [],
+  worldSoftRules: [],
+  characters: [],
+  relationships: [],
+  narrativeRules: {
+    pov: "third_limited",
+    tense: "past",
+    tone: "neutral",
+    pacing: "medium",
+    sceneLengthWords: { min: 800, max: 1200 },
+    dialogueRatio: 0.4,
+    showDontTell: true,
+    forbiddenTropes: ["deus_ex_machina"],
+  },
+  scenes: [],
+  continuityLog: [],
+};
+
+--------------------------------------------------------------------------------
+PLIK 2: src/lib/world/compile.ts
+--------------------------------------------------------------------------------
+
+import type { StoryBible, ContinuityEntry } from "./schemas";
+
+export interface CompiledContext {
+  systemPrompt: string;
+  sceneContext: string;
+}
+
+export function compileStoryContext(
+  bible: StoryBible,
+  sceneId: string,
+  previousScenes: ContinuityEntry[],
+): CompiledContext {
+  const scene = bible.scenes.find((s) => s.id === sceneId);
+  if (!scene) throw new Error(`Scene ${sceneId} not found`);
+
+  const hardRules = bible.worldHardRules
+    .map((r) => `[${r.category}] ${r.rule}\n  -> violation: ${r.violationConsequence}`)
+    .join("\n");
+
+  const softRules = bible.worldSoftRules
+    .map((r) => `- ${r.rule}${r.conditions?.length ? ` (conditions: ${r.conditions.join(", ")})` : ""}`)
+    .join("\n");
+
+  const n = bible.narrativeRules;
+  const systemPrompt = `
+You are a narrator and co-author of a novel. Generate text STRICTLY according
+to the WORLD BIBLE and NARRATIVE RULES below. Do not change facts,
+relationships, or character traits without explicit consent.
+
+## HARD WORLD RULES (never violate)
+${hardRules || "(none)"}
+
+## SOFT WORLD RULES (may bend with justification)
+${softRules || "(none)"}
+
+## NARRATIVE RULES
+- POV: ${n.pov}
+- Tense: ${n.tense}
+- Tone: ${n.tone}
+- Pacing: ${n.pacing}
+- Scene length: ${n.sceneLengthWords.min}-${n.sceneLengthWords.max} words
+- Dialogue ratio: ${n.dialogueRatio}
+- Show, don't tell: ${n.showDontTell}
+- Forbidden tropes: ${n.forbiddenTropes.join(", ") || "(none)"}
+
+## RESPONSE FORMAT
+Return ONLY a JSON object with this shape:
+{
+  "prose": "scene text",
+  "factsEstablished": ["fact 1", "fact 2"],
+  "relationshipChanges": [
+    { "from": "name", "to": "name", "newState": "desc", "reason": "why" }
+  ],
+  "newElementsIntroduced": ["new element"]
+}
+No text outside the JSON.
+`.trim();
+
+  const sceneCharacters = bible.characters.filter((c) =>
+    scene.characterIds.includes(c.id),
+  );
+
+  const characterBlock = sceneCharacters
+    .map((c) => `
+[${c.name}]${c.aliases?.length ? ` (aka ${c.aliases.join(", ")})` : ""}
+- Appearance: ${c.appearance}
+- Traits: ${c.traits.join(", ")}
+- Motivation: ${c.motivation}
+- Fear: ${c.fear}
+- Speech style: ${c.speechStyle}
+${c.arc ? `- Arc: ${c.arc.from} -> ${c.arc.to}` : ""}
+${c.secret ? `- SECRET (do not reveal explicitly): ${c.secret}` : ""}
+`)
+    .join("\n");
+
+  const relationships = bible.relationships
+    .filter(
+      (r) =>
+        scene.characterIds.includes(r.fromId) &&
+        scene.characterIds.includes(r.toId),
+    )
+    .map((r) => {
+      const from = bible.characters.find((c) => c.id === r.fromId)?.name ?? r.fromId;
+      const to = bible.characters.find((c) => c.id === r.toId)?.name ?? r.toId;
+      return `- ${from} -> ${to}: ${r.type} (${r.intensity}/10). ${r.currentState}`;
+    })
+    .join("\n");
+
+  const recentSummary = previousScenes
+    .slice(-3)
+    .map((p) => `[${p.sceneId}] ${p.summary}`)
+    .join("\n");
+
+  const allFacts = bible.continuityLog
+    .flatMap((c) => c.facts)
+    .slice(-30)
+    .map((f) => `- ${f}`)
+    .join("\n");
+
+  const sceneContext = `
+## CHARACTERS IN THIS SCENE
+${characterBlock || "(none)"}
+
+## RELATIONSHIPS IN THIS SCENE
+${relationships || "(none)"}
+
+## SCENE PLAN
+- Title: ${scene.title}
+- Goal: ${scene.goal}
+- Location: ${scene.location}
+- Time: ${scene.time}
+- Conflict: ${scene.conflict}
+- Turning point: ${scene.turningPoint}
+- Consequence: ${scene.consequence}
+
+## PREVIOUS SCENES SUMMARY
+${recentSummary || "(none - first scene)"}
+
+## ESTABLISHED FACTS (do not contradict)
+${allFacts || "(none)"}
+`.trim();
+
+  return { systemPrompt, sceneContext };
+}
+
+--------------------------------------------------------------------------------
+PLIK 3: src/lib/world/validate.ts
+--------------------------------------------------------------------------------
+
+import type { SceneOutput, StoryBible } from "./schemas";
+
+export interface ValidationIssue {
+  type: "hard_rule_violation" | "relationship_inconsistency"
+      | "character_contradiction" | "new_element";
+  message: string;
+  severity: "error" | "warning";
+}
+
+export function validateSceneAgainstBible(
+  scene: SceneOutput,
+  bible: StoryBible,
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const proseLower = scene.prose.toLowerCase();
+
+  for (const rule of bible.worldHardRules) {
+    const keywords = rule.rule.toLowerCase().split(/\s+/).filter((w) => w.length > 4);
+    const hits = keywords.filter((k) => proseLower.includes(k));
+    if (hits.length >= 3) {
+      issues.push({
+        type: "hard_rule_violation",
+        message: `Possible hard-rule violation "${rule.rule}" (hits: ${hits.join(", ")})`,
+        severity: "warning",
+      });
+    }
+  }
+
+  const nameToId = new Map(bible.characters.map((c) => [c.name, c.id]));
+  for (const change of scene.relationshipChanges) {
+    const fromId = nameToId.get(change.from);
+    const toId = nameToId.get(change.to);
+    if (!fromId || !toId) {
+      issues.push({
+        type: "character_contradiction",
+        message: `Unknown character in relationship change: ${change.from} -> ${change.to}`,
+        severity: "error",
+      });
+      continue;
+    }
+    const exists = bible.relationships.some(
+      (r) => r.fromId === fromId && r.toId === toId,
+    );
+    if (!exists) {
+      issues.push({
+        type: "relationship_inconsistency",
+        message: `Relationship ${change.from} -> ${change.to} not in world bible`,
+        severity: "warning",
+      });
+    }
+  }
+
+  for (const el of scene.newElementsIntroduced) {
+    issues.push({
+      type: "new_element",
+      message: `New world element needs confirmation: ${el}`,
+      severity: "warning",
+    });
+  }
+
+  return issues;
+}
+
+--------------------------------------------------------------------------------
+PLIK 4: src/lib/world/continuity.ts
+--------------------------------------------------------------------------------
+
+import type { SceneOutput, StoryBible } from "./schemas";
+
+export function applyContinuity(
+  bible: StoryBible,
+  sceneId: string,
+  output: SceneOutput,
+): StoryBible {
+  const next = structuredClone(bible);
+  next.continuityLog.push({
+    sceneId,
+    summary: output.prose.slice(0, 300),
+    facts: output.factsEstablished,
+    relationshipChanges: output.relationshipChanges,
+    newElements: output.newElementsIntroduced,
+    timestamp: Date.now(),
+  });
+
+  const nameToId = new Map(next.characters.map((c) => [c.name, c.id]));
+  for (const ch of output.relationshipChanges) {
+    const fromId = nameToId.get(ch.from);
+    const toId = nameToId.get(ch.to);
+    if (!fromId || !toId) continue;
+    const rel = next.relationships.find(
+      (r) => r.fromId === fromId && r.toId === toId,
+    );
+    if (rel) rel.currentState = ch.newState;
+  }
+
+  return next;
+}
+
+--------------------------------------------------------------------------------
+PLIK 5: src/app/api/world/generate/route.ts
+--------------------------------------------------------------------------------
+
+import { NextResponse } from "next/server";
+import { compileStoryContext } from "@/lib/world/compile";
+import {
+  SceneOutputSchema,
+  type StoryBible,
+  type ContinuityEntry,
+} from "@/lib/world/schemas";
+
+export const runtime = "nodejs";
+
+const MODEL = "deepseek/deepseek-v4.1-flash";
+
+export async function POST(req: Request) {
+  const { bible, sceneId, previousScenes } = (await req.json()) as {
+    bible: StoryBible;
+    sceneId: string;
+    previousScenes: ContinuityEntry[];
+  };
+
+  const { systemPrompt, sceneContext } = compileStoryContext(
+    bible,
+    sceneId,
+    previousScenes,
+  );
+
+  const response = await fetch(
+    "https://openrouter.ai/api/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://futurewriter.app",
+        "X-Title": "FutureWriter",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: sceneContext },
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.7,
+        max_tokens: 4096,
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    return NextResponse.json(
+      { error: `Upstream ${response.status}`, detail: text },
+      { status: 502 },
+    );
+  }
+
+  const data = await response.json();
+  const raw = data.choices?.[0]?.message?.content ?? "";
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return NextResponse.json(
+      { error: "Model did not return valid JSON", raw },
+      { status: 422 },
+    );
+  }
+
+  const schema = SceneOutputSchema.safeParse(parsed);
+  if (!schema.success) {
+    return NextResponse.json(
+      { error: "Schema mismatch", details: schema.error.message, raw },
+      { status: 422 },
+    );
+  }
+
+  return NextResponse.json({ output: schema.data });
+}
+
+--------------------------------------------------------------------------------
+PLIK 6: src/app/actions/world.ts
+--------------------------------------------------------------------------------
+
+"use server";
+
+import { createClient } from "@/lib/supabase/server";
+import {
+  StoryBibleSchema,
+  emptyBible,
+  type StoryBible,
+} from "@/lib/world/schemas";
+
+export async function getStoryBible(projectId: string): Promise<StoryBible> {
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("story_bibles")
+    .select("bible")
+    .eq("project_id", projectId)
+    .maybeSingle();
+  if (!data?.bible) return emptyBible;
+  const parsed = StoryBibleSchema.safeParse(data.bible);
+  return parsed.success ? parsed.data : emptyBible;
+}
+
+export async function saveStoryBible(projectId: string, bible: StoryBible) {
+  const supabase = await createClient();
+  await supabase
+    .from("story_bibles")
+    .upsert(
+      {
+        project_id: projectId,
+        bible,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "project_id" },
+    );
+}
+
+UWAGA: Dostosuj import createClient do ścieżki, którą już używasz w projekcie
+(np. @/utils/supabase/server, @/lib/supabase/server).
+
+--------------------------------------------------------------------------------
+PLIK 7: src/components/world/WorldPanel.tsx
+--------------------------------------------------------------------------------
+
+"use client";
+
+import { useState } from "react";
+import type {
+  StoryBible,
+  HardRule,
+  SoftRule,
+  Character,
+  Relationship,
+} from "@/lib/world/schemas";
+
+type Props = {
+  bible: StoryBible;
+  onChange: (next: StoryBible) => void;
+};
+
+type Section = "hard" | "soft" | "chars" | "rels" | "narr";
+
+const uid = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2);
+
+const input =
+  "w-full rounded border border-black/[.12] bg-transparent px-2 py-1 text-xs text-zinc-800 outline-none focus:border-zinc-400 dark:border-white/[.18] dark:text-zinc-200 dark:focus:border-zinc-500";
+const label = "text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400";
+const btn =
+  "rounded-md border border-black/[.12] px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-black/[.06] dark:border-white/[.18] dark:text-zinc-300 dark:hover:bg-white/[.08]";
+const btnDanger =
+  "rounded-md border border-red-500/40 px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-500/10 dark:text-red-400";
+
+export function WorldPanel({ bible, onChange }: Props) {
+  const [section, setSection] = useState<Section>("hard");
+  const patch = (partial: Partial<StoryBible>) => onChange({ ...bible, ...partial });
+
+  return (
+    <div className="mt-3 flex min-h-0 flex-1 flex-col gap-2 text-sm">
+      <div className="flex flex-wrap gap-1 border-b border-black/[.08] pb-2 dark:border-white/[.12]">
+        {([
+          ["hard", "Hard"],
+          ["soft", "Soft"],
+          ["chars", "Characters"],
+          ["rels", "Relations"],
+          ["narr", "Narrative"],
+        ] as const).map(([id, text]) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setSection(id)}
+            className={`rounded px-2 py-1 text-xs ${
+              section === id
+                ? "bg-zinc-200 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100"
+                : "text-zinc-600 hover:bg-black/[.06] dark:text-zinc-400 dark:hover:bg-white/[.08]"
+            }`}
+          >
+            {text}
+          </button>
+        ))}
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+        {section === "hard" && (
+          <HardRulesEditor
+            rules={bible.worldHardRules}
+            onChange={(worldHardRules) => patch({ worldHardRules })}
+          />
+        )}
+        {section === "soft" && (
+          <SoftRulesEditor
+            rules={bible.worldSoftRules}
+            onChange={(worldSoftRules) => patch({ worldSoftRules })}
+          />
+        )}
+        {section === "chars" && (
+          <CharactersEditor
+            characters={bible.characters}
+            onChange={(characters) => patch({ characters })}
+          />
+        )}
+        {section === "rels" && (
+          <RelationshipsEditor
+            characters={bible.characters}
+            relationships={bible.relationships}
+            onChange={(relationships) => patch({ relationships })}
+          />
+        )}
+        {section === "narr" && (
+          <NarrativeEditor
+            rules={bible.narrativeRules}
+            onChange={(narrativeRules) => patch({ narrativeRules })}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function HardRulesEditor({
+  rules,
+  onChange,
+}: {
+  rules: HardRule[];
+  onChange: (next: HardRule[]) => void;
+}) {
+  const update = (id: string, patch: Partial<HardRule>) =>
+    onChange(rules.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+
+  return (
+    <div className="space-y-3">
+      {rules.map((r) => (
+        <div
+          key={r.id}
+          className="space-y-1 rounded border border-black/[.08] p-2 dark:border-white/[.12]"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <select
+              value={r.category}
+              onChange={(e) =>
+                update(r.id, { category: e.target.value as HardRule["category"] })
+              }
+              className={input}
+            >
+              {["physics", "magic", "social", "timeline", "geography"].map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className={btnDanger}
+              onClick={() => onChange(rules.filter((x) => x.id !== r.id))}
+            >
+              Delete
+            </button>
+          </div>
+          <div>
+            <span className={label}>Rule</span>
+            <textarea
+              value={r.rule}
+              rows={2}
+              onChange={(e) => update(r.id, { rule: e.target.value })}
+              className={input}
+            />
+          </div>
+          <div>
+            <span className={label}>Violation consequence</span>
+            <textarea
+              value={r.violationConsequence}
+              rows={2}
+              onChange={(e) => update(r.id, { violationConsequence: e.target.value })}
+              className={input}
+            />
+          </div>
+        </div>
+      ))}
+      <button
+        type="button"
+        className={btn}
+        onClick={() =>
+          onChange([
+            ...rules,
+            {
+              id: uid(),
+              category: "physics",
+              rule: "",
+              violationConsequence: "",
+            },
+          ])
+        }
+      >
+        + Add hard rule
+      </button>
+    </div>
+  );
+}
+
+function SoftRulesEditor({
+  rules,
+  onChange,
+}: {
+  rules: SoftRule[];
+  onChange: (next: SoftRule[]) => void;
+}) {
+  const update = (id: string, patch: Partial<SoftRule>) =>
+    onChange(rules.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+
+  return (
+    <div className="space-y-3">
+      {rules.map((r) => (
+        <div
+          key={r.id}
+          className="space-y-1 rounded border border-black/[.08] p-2 dark:border-white/[.12]"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span className={label}>Soft rule</span>
+            <button
+              type="button"
+              className={btnDanger}
+              onClick={() => onChange(rules.filter((x) => x.id !== r.id))}
+            >
+              Delete
+            </button>
+          </div>
+          <textarea
+            value={r.rule}
+            rows={2}
+            onChange={(e) => update(r.id, { rule: e.target.value })}
+            className={input}
+          />
+          <div>
+            <span className={label}>Conditions (comma separated)</span>
+            <input
+              value={(r.conditions ?? []).join(", ")}
+              onChange={(e) =>
+                update(r.id, {
+                  conditions: e.target.value
+                    .split(",")
+                    .map((s) => s.trim())
+                    .filter(Boolean),
+                })
+              }
+              className={input}
+            />
+          </div>
+        </div>
+      ))}
+      <button
+        type="button"
+        className={btn}
+        onClick={() => onChange([...rules, { id: uid(), rule: "" }])}
+      >
+        + Add soft rule
+      </button>
+    </div>
+  );
+}
+
+function CharactersEditor({
+  characters,
+  onChange,
+}: {
+  characters: Character[];
+  onChange: (next: Character[]) => void;
+}) {
+  const update = (id: string, patch: Partial<Character>) =>
+    onChange(characters.map((c) => (c.id === id ? { ...c, ...patch } : c)));
+
+  const splitCsv = (v: string) =>
+    v.split(",").map((s) => s.trim()).filter(Boolean);
+
+  return (
+    <div className="space-y-3">
+      {characters.map((c) => (
+        <details
+          key={c.id}
+          className="rounded border border-black/[.08] p-2 dark:border-white/[.12]"
+        >
+          <summary className="flex cursor-pointer items-center justify-between gap-2">
+            <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+              {c.name || "(unnamed)"}
+            </span>
+            <button
+              type="button"
+              className={btnDanger}
+              onClick={(e) => {
+                e.preventDefault();
+                onChange(characters.filter((x) => x.id !== c.id));
+              }}
+            >
+              Delete
+            </button>
+          </summary>
+          <div className="mt-2 space-y-1">
+            <div>
+              <span className={label}>Name</span>
+              <input
+                value={c.name}
+                onChange={(e) => update(c.id, { name: e.target.value })}
+                className={input}
+              />
+            </div>
+            <div>
+              <span className={label}>Aliases (comma separated)</span>
+              <input
+                value={(c.aliases ?? []).join(", ")}
+                onChange={(e) => update(c.id, { aliases: splitCsv(e.target.value) })}
+                className={input}
+              />
+            </div>
+            <div>
+              <span className={label}>Appearance</span>
+              <textarea
+                rows={2}
+                value={c.appearance}
+                onChange={(e) => update(c.id, { appearance: e.target.value })}
+                className={input}
+              />
+            </div>
+            <div>
+              <span className={label}>Traits (comma separated)</span>
+              <input
+                value={c.traits.join(", ")}
+                onChange={(e) => update(c.id, { traits: splitCsv(e.target.value) })}
+                className={input}
+              />
+            </div>
+            <div>
+              <span className={label}>Motivation</span>
+              <textarea
+                rows={2}
+                value={c.motivation}
+                onChange={(e) => update(c.id, { motivation: e.target.value })}
+                className={input}
+              />
+            </div>
+            <div>
+              <span className={label}>Fear</span>
+              <textarea
+                rows={2}
+                value={c.fear}
+                onChange={(e) => update(c.id, { fear: e.target.value })}
+                className={input}
+              />
+            </div>
+            <div>
+              <span className={label}>Secret (optional)</span>
+              <textarea
+                rows={2}
+                value={c.secret ?? ""}
+                onChange={(e) => update(c.id, { secret: e.target.value })}
+                className={input}
+              />
+            </div>
+            <div>
+              <span className={label}>Speech style</span>
+              <textarea
+                rows={2}
+                value={c.speechStyle}
+                onChange={(e) => update(c.id, { speechStyle: e.target.value })}
+                className={input}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <span className={label}>Arc from</span>
+                <input
+                  value={c.arc?.from ?? ""}
+                  onChange={(e) =>
+                    update(c.id, {
+                      arc: { from: e.target.value, to: c.arc?.to ?? "" },
+                    })
+                  }
+                  className={input}
+                />
+              </div>
+              <div>
+                <span className={label}>Arc to</span>
+                <input
+                  value={c.arc?.to ?? ""}
+                  onChange={(e) =>
+                    update(c.id, {
+                      arc: { from: c.arc?.from ?? "", to: e.target.value },
+                    })
+                  }
+                  className={input}
+                />
+              </div>
+            </div>
+          </div>
+        </details>
+      ))}
+      <button
+        type="button"
+        className={btn}
+        onClick={() =>
+          onChange([
+            ...characters,
+            {
+              id: uid(),
+              name: "",
+              appearance: "",
+              traits: [""],
+              motivation: "",
+              fear: "",
+              speechStyle: "",
+            },
+          ])
+        }
+      >
+        + Add character
+      </button>
+    </div>
+  );
+}
+
+function RelationshipsEditor({
+  characters,
+  relationships,
+  onChange,
+}: {
+  characters: Character[];
+  relationships: Relationship[];
+  onChange: (next: Relationship[]) => void;
+}) {
+  const update = (idx: number, patch: Partial<Relationship>) =>
+    onChange(relationships.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+
+  return (
+    <div className="space-y-3">
+      {relationships.map((r, idx) => (
+        <div
+          key={idx}
+          className="space-y-1 rounded border border-black/[.08] p-2 dark:border-white/[.12]"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span className={label}>Relationship</span>
+            <button
+              type="button"
+              className={btnDanger}
+              onClick={() => onChange(relationships.filter((_, i) => i !== idx))}
+            >
+              Delete
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <select
+              value={r.fromId}
+              onChange={(e) => update(idx, { fromId: e.target.value })}
+              className={input}
+            >
+              <option value="">From...</option>
+              {characters.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name || "(unnamed)"}
+                </option>
+              ))}
+            </select>
+            <select
+              value={r.toId}
+              onChange={(e) => update(idx, { toId: e.target.value })}
+              className={input}
+            >
+              <option value="">To...</option>
+              {characters.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name || "(unnamed)"}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <select
+              value={r.type}
+              onChange={(e) =>
+                update(idx, { type: e.target.value as Relationship["type"] })
+              }
+              className={input}
+            >
+              {[
+                "love", "hate", "friend", "rival",
+                "family", "mentor", "betrayal", "debt",
+              ].map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+            <input
+              type="number"
+              min={1}
+              max={10}
+              value={r.intensity}
+              onChange={(e) => update(idx, { intensity: Number(e.target.value) })}
+              className={input}
+            />
+          </div>
+          <div>
+            <span className={label}>History</span>
+            <textarea
+              rows={2}
+              value={r.history}
+              onChange={(e) => update(idx, { history: e.target.value })}
+              className={input}
+            />
+          </div>
+          <div>
+            <span className={label}>Current state</span>
+            <textarea
+              rows={2}
+              value={r.currentState}
+              onChange={(e) => update(idx, { currentState: e.target.value })}
+              className={input}
+            />
+          </div>
+        </div>
+      ))}
+      <button
+        type="button"
+        className={btn}
+        disabled={characters.length < 2}
+        onClick={() =>
+          onChange([
+            ...relationships,
+            {
+              fromId: characters[0]?.id ?? "",
+              toId: characters[1]?.id ?? "",
+              type: "friend",
+              intensity: 5,
+              history: "",
+              currentState: "",
+            },
+          ])
+        }
+      >
+        + Add relationship
+      </button>
+    </div>
+  );
+}
+
+function NarrativeEditor({
+  rules,
+  onChange,
+}: {
+  rules: StoryBible["narrativeRules"];
+  onChange: (next: StoryBible["narrativeRules"]) => void;
+}) {
+  const splitCsv = (v: string) =>
+    v.split(",").map((s) => s.trim()).filter(Boolean);
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <span className={label}>POV</span>
+          <select
+            value={rules.pov}
+            onChange={(e) =>
+              onChange({ ...rules, pov: e.target.value as typeof rules.pov })
+            }
+            className={input}
+          >
+            {["first", "third_limited", "third_omniscient"].map((v) => (
+              <option key={v} value={v}>
+                {v}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <span className={label}>Tense</span>
+          <select
+            value={rules.tense}
+            onChange={(e) =>
+              onChange({ ...rules, tense: e.target.value as typeof rules.tense })
+            }
+            className={input}
+          >
+            {["past", "present"].map((v) => (
+              <option key={v} value={v}>
+                {v}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <span className={label}>Tone</span>
+          <input
+            value={rules.tone}
+            onChange={(e) => onChange({ ...rules, tone: e.target.value })}
+            className={input}
+          />
+        </div>
+        <div>
+          <span className={label}>Pacing</span>
+          <select
+            value={rules.pacing}
+            onChange={(e) =>
+              onChange({ ...rules, pacing: e.target.value as typeof rules.pacing })
+            }
+            className={input}
+          >
+            {["slow", "medium", "fast"].map((v) => (
+              <option key={v} value={v}>
+                {v}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <div>
+          <span className={label}>Scene min words</span>
+          <input
+            type="number"
+            value={rules.sceneLengthWords.min}
+            onChange={(e) =>
+              onChange({
+                ...rules,
+                sceneLengthWords: {
+                  ...rules.sceneLengthWords,
+                  min: Number(e.target.value),
+                },
+              })
+            }
+            className={input}
+          />
+        </div>
+        <div>
+          <span className={label}>Scene max words</span>
+          <input
+            type="number"
+            value={rules.sceneLengthWords.max}
+            onChange={(e) =>
+              onChange({
+                ...rules,
+                sceneLengthWords: {
+                  ...rules.sceneLengthWords,
+                  max: Number(e.target.value),
+                },
+              })
+            }
+            className={input}
+          />
+        </div>
+      </div>
+      <div>
+        <span className={label}>Dialogue ratio (0-1)</span>
+        <input
+          type="number"
+          step="0.05"
+          min={0}
+          max={1}
+          value={rules.dialogueRatio}
+          onChange={(e) =>
+            onChange({ ...rules, dialogueRatio: Number(e.target.value) })
+          }
+          className={input}
+        />
+      </div>
+      <label className="flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+        <input
+          type="checkbox"
+          checked={rules.showDontTell}
+          onChange={(e) => onChange({ ...rules, showDontTell: e.target.checked })}
+        />
+        Show, don't tell
+      </label>
+      <div>
+        <span className={label}>Forbidden tropes (comma separated)</span>
+        <input
+          value={rules.forbiddenTropes.join(", ")}
+          onChange={(e) =>
+            onChange({ ...rules, forbiddenTropes: splitCsv(e.target.value) })
+          }
+          className={input}
+        />
+      </div>
+    </div>
+  );
+}
+
+--------------------------------------------------------------------------------
+PLIK 8: src/components/world/ScenePanel.tsx
+--------------------------------------------------------------------------------
+
+"use client";
+
+import { useState } from "react";
+import type { StoryBible, SceneOutput } from "@/lib/world/schemas";
+import {
+  validateSceneAgainstBible,
+  type ValidationIssue,
+} from "@/lib/world/validate";
+import { applyContinuity } from "@/lib/world/continuity";
+
+type Props = {
+  bible: StoryBible;
+  onInsertToDraft: (text: string) => void;
+  onApplyContinuity: (next: StoryBible) => void;
+};
+
+const uid = () =>
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2);
+
+const input =
+  "w-full rounded border border-black/[.12] bg-transparent px-2 py-1 text-xs text-zinc-800 outline-none focus:border-zinc-400 dark:border-white/[.18] dark:text-zinc-200";
+const label = "text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400";
+const btn =
+  "rounded-md border border-black/[.12] px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-black/[.06] dark:border-white/[.18] dark:text-zinc-300";
+
+export function ScenePanel({ bible, onInsertToDraft, onApplyContinuity }: Props) {
+  const [sceneId, setSceneId] = useState(bible.scenes[0]?.id ?? "");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<SceneOutput | null>(null);
+  const [issues, setIssues] = useState<ValidationIssue[]>([]);
+  const [error, setError] = useState("");
+  const [showEditor, setShowEditor] = useState(false);
+
+  const scene = bible.scenes.find((s) => s.id === sceneId);
+
+  function addScene() {
+    const s = {
+      id: uid(),
+      title: "New scene",
+      goal: "",
+      location: "",
+      time: "",
+      characterIds: [],
+      conflict: "",
+      turningPoint: "",
+      consequence: "",
+      status: "planned" as const,
+    };
+    onApplyContinuity({ ...bible, scenes: [...bible.scenes, s] });
+    setSceneId(s.id);
+    setShowEditor(true);
+  }
+
+  function updateScene(patch: Partial<NonNullable<typeof scene>>) {
+    if (!scene) return;
+    onApplyContinuity({
+      ...bible,
+      scenes: bible.scenes.map((s) => (s.id === scene.id ? { ...s, ...patch } : s)),
+    });
+  }
+
+  async function generate() {
+    if (!sceneId) return;
+    setBusy(true);
+    setError("");
+    setResult(null);
+    setIssues([]);
+    try {
+      const res = await fetch("/api/world/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bible,
+          sceneId,
+          previousScenes: bible.continuityLog,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? "Generation failed");
+      setResult(data.output);
+      setIssues(validateSceneAgainstBible(data.output, bible));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function accept() {
+    if (!result) return;
+    onInsertToDraft(result.prose);
+    onApplyContinuity(applyContinuity(bible, sceneId, result));
+    setResult(null);
+    setIssues([]);
+  }
+
+  function toggleCharacter(id: string) {
+    if (!scene) return;
+    const has = scene.characterIds.includes(id);
+    updateScene({
+      characterIds: has
+        ? scene.characterIds.filter((x) => x !== id)
+        : [...scene.characterIds, id],
+    });
+  }
+
+  return (
+    <div className="mt-3 flex min-h-0 flex-1 flex-col gap-2 text-sm">
+      <div className="flex gap-1">
+        <select
+          value={sceneId}
+          onChange={(e) => setSceneId(e.target.value)}
+          className={input}
+        >
+          <option value="">Select scene...</option>
+          {bible.scenes.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.title}
+            </option>
+          ))}
+        </select>
+        <button type="button" className={btn} onClick={addScene}>
+          + New
+        </button>
+      </div>
+
+      {scene && (
+        <>
+          <button
+            type="button"
+            className={btn}
+            onClick={() => setShowEditor((v) => !v)}
+          >
+            {showEditor ? "Hide scene plan" : "Edit scene plan"}
+          </button>
+
+          {showEditor && (
+            <div className="space-y-1 rounded border border-black/[.08] p-2 dark:border-white/[.12]">
+              {(["title", "goal", "location", "time", "conflict", "turningPoint", "consequence"] as const).map(
+                (field) => (
+                  <div key={field}>
+                    <span className={label}>{field}</span>
+                    <textarea
+                      rows={field === "title" ? 1 : 2}
+                      value={scene[field]}
+                      onChange={(e) => updateScene({ [field]: e.target.value })}
+                      className={input}
+                    />
+                  </div>
+                ),
+              )}
+              <div>
+                <span className={label}>Characters</span>
+                <div className="flex flex-wrap gap-1">
+                  {bible.characters.map((c) => (
+                    <button
+                      key={c.id}
+                      type="button"
+                      onClick={() => toggleCharacter(c.id)}
+                      className={`rounded px-2 py-1 text-xs ${
+                        scene.characterIds.includes(c.id)
+                          ? "bg-zinc-800 text-white dark:bg-zinc-200 dark:text-zinc-900"
+                          : "border border-black/[.12] dark:border-white/[.18]"
+                      }`}
+                    >
+                      {c.name || "(unnamed)"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={generate}
+            disabled={busy}
+            className="rounded-lg bg-zinc-900 px-3 py-1.5 text-sm text-white disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-900"
+          >
+            {busy ? "Generating..." : "Generate scene"}
+          </button>
+        </>
+      )}
+
+      {error && <p className="text-xs text-red-600 dark:text-red-400">{error}</p>}
+
+      {issues.length > 0 && (
+        <ul className="space-y-1 text-xs">
+          {issues.map((iss, i) => (
+            <li
+              key={i}
+              className={
+                iss.severity === "error"
+                  ? "text-red-600 dark:text-red-400"
+                  : "text-amber-600 dark:text-amber-400"
+              }
+            >
+              [{iss.severity}] {iss.message}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {result && (
+        <>
+          <div className="min-h-0 flex-1 overflow-y-auto whitespace-pre-wrap rounded border border-black/[.08] p-2 text-xs dark:border-white/[.12]">
+            {result.prose}
+          </div>
+          <button
+            type="button"
+            onClick={accept}
+            className="rounded-lg bg-emerald-600 px-3 py-1.5 text-sm text-white"
+          >
+            Accept → Draft + Continuity
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+================================================================================
+KROK 3 — MODYFIKACJA src/components/workspace-editor.tsx
+================================================================================
+
+Wprowadź 6 zmian. NIE usuwaj niczego istniejącego.
+
+--- 3a. IMPORTY (na górze pliku, obok istniejących importów) ---
+
+import { WorldPanel } from "@/components/world/WorldPanel";
+import { ScenePanel } from "@/components/world/ScenePanel";
+import { getStoryBible, saveStoryBible } from "@/app/actions/world";
+import { emptyBible, type StoryBible } from "@/lib/world/schemas";
+
+--- 3b. NOWY STAN (w ciele WorkspaceEditor, obok messages, inquiry) ---
+
+const [rightTab, setRightTab] = useState<"chat" | "world" | "scene">("chat");
+const [bible, setBible] = useState<StoryBible>(emptyBible);
+const [bibleLoaded, setBibleLoaded] = useState(false);
+
+--- 3c. EFEKT ŁADOWANIA (obok innych useEffect) ---
+
+useEffect(() => {
+  void (async () => {
+    try {
+      const loaded = await getStoryBible(project.id);
+      setBible(loaded);
+    } finally {
+      setBibleLoaded(true);
+    }
+  })();
+}, [project.id]);
+
+--- 3d. EFEKT ZAPISU (debounced 800ms) ---
+
+useEffect(() => {
+  if (!bibleLoaded) return;
+  const t = setTimeout(() => {
+    void saveStoryBible(project.id, bible);
+  }, 800);
+  return () => clearTimeout(t);
+}, [bible, bibleLoaded, project.id]);
+
+--- 3e. NAGŁÓWEK PRAWEGO PANELU ---
+
+ZNAJDŹ:
+<h2 className={panelTitleClass}>AI assistant</h2>
+
+ZASTĄP:
+<div className="flex items-center justify-between">
+  <h2 className={panelTitleClass}>AI assistant</h2>
+  <div className="flex gap-1 text-xs">
+    {(["chat", "world", "scene"] as const).map((t) => (
+      <button
+        key={t}
+        type="button"
+        onClick={() => setRightTab(t)}
+        className={`rounded-md px-2 py-1 capitalize ${
+          rightTab === t
+            ? "bg-zinc-200 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100"
+            : "text-zinc-500 hover:bg-black/[.06] dark:text-zinc-400 dark:hover:bg-white/[.08]"
+        }`}
+      >
+        {t}
+      </button>
+    ))}
+  </div>
+</div>
+
+--- 3f. WARUNKOWE RENDEROWANIE ---
+
+ZNAJDŹ blok zaczynający się od komentarza:
+{/* Upper half: the conversation coming back from the assistant. */}
+
+...i cały blok aż do zamknięcia sekcji z przyciskiem Send (włącznie z chatError
+i textarea oraz przyciskiem Send).
+
+OWIŃ GO w:
+
+{rightTab === "chat" && (
+  <>
+    {/* ... cały istniejący blok bez zmian ... */}
+  </>
+)}
+
+{rightTab === "world" && (
+  <WorldPanel bible={bible} onChange={setBible} />
+)}
+
+{rightTab === "scene" && (
+  <ScenePanel
+    bible={bible}
+    onInsertToDraft={(text) => insertIntoDraft(text)}
+    onApplyContinuity={(next) => setBible(next)}
+  />
+)}
+
+================================================================================
+KROK 4 — ZALEŻNOŚCI I ENV
+================================================================================
+
+W terminalu:
+npm install zod
+
+W .env.local (już masz, bo czat działa):
+OPENROUTER_API_KEY=sk-or-v1-...
+
+================================================================================
+KROK 5 — WERYFIKACJA
+================================================================================
+
+1. Uruchom: npm run dev
+2. Otwórz projekt w FutureWriter.
+3. Prawy panel pokaże: [chat] [world] [scene]
+4. Zakładka world:
+   - Dodaj twardą regułę (np. "No flying", physics, "Character falls").
+   - Dodaj 2 postacie.
+   - Dodaj relację między nimi.
+   - Ustaw narrację.
+5. Zakładka scene:
+   - + New → utwórz scenę.
+   - Zaznacz postacie.
+   - Wypełnij cel, miejsce, konflikt.
+   - Generate scene.
+   - Sprawdź walidację.
+   - Accept → Draft + Continuity.
+   - Tekst pojawi się w edytorze w miejscu kursora.
+6. Zakładka chat — działa jak wcześniej.
+
+================================================================================
+UWAGI O MODELU deepseek/deepseek-v4.1-flash (przez OpenRouter)
+================================================================================
+
+- JSON mode: response_format: { type: "json_object" } — wspierane.
+- NIE używaj strict: true ani json_schema — model tego nie wspiera.
+- Thinking mode: domyślnie ON. temperature wtedy NIE działa. Jeśli chcesz
+  stabilność, dodaj "reasoning": { "enabled": false } do body (sprawdź
+  aktualną składnię w dokumentacji OpenRouter).
+- Zawsze waliduj przez SceneOutputSchema.safeParse() — ostatnia linia obrony.
+- Nagłówki HTTP-Referer i X-Title są opcjonalne, ale pomagają w rankingu.
+
+================================================================================
+ZASADY PROJEKTOWE
+================================================================================
+
+1. Panel, nie hardkod — reguły to dane w Supabase (JSONB).
+2. Nigdy nie ufaj modelowi — Zod + validateSceneAgainstBible + akceptacja.
+3. Pisarz ma ostatnie słowo — Accept dopiero po review.
+4. Nie łam istniejącego kodu — tylko dodawaj pliki i wstawiaj 6 fragmentów.
+5. insertIntoDraft — używamy ponownie istniejącej funkcji.
+6. Debounced save — 800ms.
+7. Continuity jest święta — established facts nie mogą się zmienić.
+
+================================================================================
+KONIEC INSTRUKCJI
+================================================================================
