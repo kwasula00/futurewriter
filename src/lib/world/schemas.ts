@@ -125,6 +125,16 @@ export const AssistantStateSchema = z.object({
   messages: z.array(AssistantMessageSchema).default([]),
 });
 
+/**
+ * A line on the project's to-do list. It is not part of the story, but it is
+ * kept with the project's other notes so it travels with the project and is
+ * written by the same save as everything else.
+ */
+export const TodoItemSchema = z.object({
+  id: z.string(),
+  text: z.string(),
+});
+
 export const StoryBibleSchema = z.object({
   version: z.number().default(1),
   worldHardRules: z.array(HardRuleSchema),
@@ -138,6 +148,8 @@ export const StoryBibleSchema = z.object({
   assistant: AssistantStateSchema.default({ messages: [] }),
   scenes: z.array(SceneTemplateSchema),
   continuityLog: z.array(ContinuityEntrySchema),
+  // Defaulted so bibles saved before the to-do list existed still parse.
+  todos: z.array(TodoItemSchema).default([]),
 });
 
 export type HardRule = z.infer<typeof HardRuleSchema>;
@@ -150,6 +162,7 @@ export type AssistantMessage = z.infer<typeof AssistantMessageSchema>;
 export type AssistantState = z.infer<typeof AssistantStateSchema>;
 export type SceneTemplate = z.infer<typeof SceneTemplateSchema>;
 export type ContinuityEntry = z.infer<typeof ContinuityEntrySchema>;
+export type TodoItem = z.infer<typeof TodoItemSchema>;
 export type StoryBible = z.infer<typeof StoryBibleSchema>;
 
 export const SceneOutputSchema = z.object({
@@ -183,4 +196,5 @@ export const emptyBible: StoryBible = {
   assistant: { messages: [] },
   scenes: [],
   continuityLog: [],
+  todos: [],
 };

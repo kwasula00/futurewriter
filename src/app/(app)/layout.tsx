@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import { logout } from "@/app/actions/auth";
 import { StoryDiagramLink } from "@/app/ui/story-diagram-link";
+import { TodoLink } from "@/app/ui/todo-link";
 import { getUser } from "@/lib/dal";
 
 /**
@@ -21,6 +22,7 @@ export default async function AppLayout({ children }: { children: React.ReactNod
 
           <nav className="flex items-center gap-4">
             {/* Keeps the open project when it links back into the workspace. */}
+            <TodoLink />
             <StoryDiagramLink />
             <Link
               href="/dashboard"

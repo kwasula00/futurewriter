@@ -40,11 +40,14 @@ export function WorkspaceShell({
   projects,
   selected,
   openDiagram = false,
+  openTodo = false,
 }: {
   projects: ProjectSummary[];
   selected: ProjectDetail | null;
   /** Set when the workspace was opened from the header's Story Diagram link. */
   openDiagram?: boolean;
+  /** Set when the workspace was opened from the header's To-do list link. */
+  openTodo?: boolean;
 }) {
   const editorRef = useRef<EditorHandle>(null);
   const [workType, setWorkType] = useState<WorkType>(selected?.workType ?? "novel");
@@ -126,7 +129,12 @@ export function WorkspaceShell({
 
       <div className="flex min-w-0 flex-1 flex-col">
         {selected ? (
-          <WorkspaceEditor ref={editorRef} project={selected} openDiagram={openDiagram} />
+          <WorkspaceEditor
+            ref={editorRef}
+            project={selected}
+            openDiagram={openDiagram}
+            openTodo={openTodo}
+          />
         ) : (
           <div className="flex flex-1 items-center justify-center rounded-2xl border border-dashed border-black/[.15] p-10 text-center dark:border-white/[.2]">
             <p className="text-sm text-zinc-600 dark:text-zinc-400">

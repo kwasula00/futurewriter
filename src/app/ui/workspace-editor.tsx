@@ -16,6 +16,7 @@ import { WorldPanel } from "@/components/world/WorldPanel";
 import { ScenePanel } from "@/components/world/ScenePanel";
 import { LanguagePanel } from "@/components/world/LanguagePanel";
 import { StoryDiagram } from "@/components/world/StoryDiagram";
+import { TodoWindow } from "@/app/ui/todo-window";
 import { getStoryBible, saveStoryBible } from "@/app/actions/world";
 import { emptyBible, type StoryBible } from "@/lib/world/schemas";
 import { compileLanguagePolicy } from "@/lib/world/compile";
@@ -311,6 +312,7 @@ export function WorkspaceEditor({
   project,
   ref,
   openDiagram = false,
+  openTodo = false,
 }: {
   project: Project;
   ref?: Ref<EditorHandle>;
@@ -320,6 +322,8 @@ export function WorkspaceEditor({
    * panel opens the same window without touching the address.
    */
   openDiagram?: boolean;
+  /** Set when the workspace was opened from the header's To-do list link. */
+  openTodo?: boolean;
 }) {
   const router = useRouter();
   const [title, setTitle] = useState(project.title);
@@ -344,6 +348,9 @@ export function WorkspaceEditor({
   // it belongs to; it can be summoned from the assistant panel or arrive
   // already open from the header link.
   const [diagramOpen, setDiagramOpen] = useState(openDiagram);
+  // The to-do list is kept with the project's bible, so the window is handed
+  // the project it belongs to; it arrives already open from the header link.
+  const [todoOpen, setTodoOpen] = useState(openTodo);
   const [bible, setBible] = useState<StoryBible>(emptyBible);
   const [bibleLoaded, setBibleLoaded] = useState(false);
   // The header link can arrive while the same project is already open, in which
@@ -355,6 +362,11 @@ export function WorkspaceEditor({
     setSeenOpenDiagram(openDiagram);
     if (openDiagram) setDiagramOpen(true);
   }
+  const [seenOpenTodo, setSeenOpenTodo] = useState(openTodo);
+  if (seenOpenTodo !== openTodo) {
+    setSeenOpenTodo(openTodo);
+    if (openTodo) setTodoOpen(true);
+  }
 
   /**
    * Closes the map. The address keeps the project it was drawn for, so a second
@@ -365,6 +377,19 @@ export function WorkspaceEditor({
     if (!openDiagram) return;
     const next = new URLSearchParams(window.location.search);
     next.delete("diagram");
+    next.set("project", project.id);
+    router.replace(`/workspace?${next.toString()}`, { scroll: false });
+  }
+
+  /**
+   * Closes the to-do list, leaving the project in the address for the same
+   * reason as the diagram: the header link reads it back.
+   */
+  function closeTodo() {
+    setTodoOpen(false);
+    if (!openTodo) return;
+    const next = new URLSearchParams(window.location.search);
+    next.delete("todo");
     next.set("project", project.id);
     router.replace(`/workspace?${next.toString()}`, { scroll: false });
   }
@@ -1711,6 +1736,14 @@ export function WorkspaceEditor({
             onInsertToDraft={(text) => insertIntoDraft(text)}
             onApplyContinuity={(next) => setBible(next)}
             onClose={closeDiagram}
+          />
+        )}
+
+        {todoOpen && (
+          <TodoWindow
+            todos={bible.todos}
+            onChange={(todos) => setBible((current) => ({ ...current, todos }))}
+            onClose={closeTodo}
           />
         )}
       </div>
