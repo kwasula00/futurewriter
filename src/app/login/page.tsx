@@ -26,7 +26,7 @@ export default async function LoginPage({
           FutureWriter
         </Link>
 
-        <h1 className="mt-6 text-2xl font-semibold tracking-tight">Log in</h1>
+        <h1 className="mt-6 text-2xl font-semibold tracking-tight text-zinc-950">Log in</h1>
         <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
           Welcome back. Pick up where you left off.
         </p>
