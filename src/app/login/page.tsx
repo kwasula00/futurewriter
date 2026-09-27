@@ -15,8 +15,13 @@ export default async function LoginPage({
   const { error } = await searchParams;
 
   return (
-    <main className="flex flex-1 items-center justify-center px-6 py-16">
-      <div className="w-full max-w-md">
+    <main className="relative flex flex-1 items-center justify-center px-6 py-16">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 bg-[url('/front-page-image.jpg')] bg-cover bg-center bg-no-repeat"
+      />
+
+      <div className="relative w-full max-w-md rounded-2xl bg-white p-8">
         <Link href="/" className="text-sm font-semibold tracking-tight">
           FutureWriter
         </Link>
