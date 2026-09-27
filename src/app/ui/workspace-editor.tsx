@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type ClipboardEvent as ReactClipboardEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type Ref,
 } from "react";
@@ -80,6 +81,7 @@ const TOOLBAR: Tool[] = [
   { label: "H1", title: "Heading 1", command: "formatBlock", value: "<h1>" },
   { label: "H2", title: "Heading 2", command: "formatBlock", value: "<h2>" },
   { label: "H3", title: "Heading 3", command: "formatBlock", value: "<h3>" },
+  { label: "H4", title: "Heading 4", command: "formatBlock", value: "<h4>" },
   { label: "•", title: "Bulleted list", command: "insertUnorderedList" },
   { label: "1.", title: "Numbered list", listStyle: "decimal" },
   { label: "a.", title: "Lowercase lettered list", listStyle: "lower-alpha" },
@@ -186,6 +188,12 @@ function holdsALine(element: Element): boolean {
 function pruneEmptyRows(root: HTMLElement): number {
   let removed = 0;
   for (const child of Array.from(root.children)) {
+    // A heading the outline owns is never the empty row of a paste: it is a
+    // structural element, so it stays even while it holds no words.
+    if (child.hasAttribute("data-section-id")) {
+      removed += pruneEmptyRows(child as HTMLElement);
+      continue;
+    }
     if (child.matches(BLOCK_SELECTOR) && !child.querySelector(BLOCK_SELECTOR)) {
       if (!holdsALine(child)) {
         child.remove();
@@ -313,6 +321,7 @@ export function WorkspaceEditor({
   ref,
   openDiagram = false,
   openTodo = false,
+  onSectionTitlesChange,
 }: {
   project: Project;
   ref?: Ref<EditorHandle>;
@@ -324,6 +333,12 @@ export function WorkspaceEditor({
   openDiagram?: boolean;
   /** Set when the workspace was opened from the header's To-do list link. */
   openTodo?: boolean;
+  /**
+   * Reports the text the writer leaves in the draft's headings, so an edit made
+   * in the prose reaches the outline and the table of contents. Only the
+   * headings whose text changed since the last report are sent.
+   */
+  onSectionTitlesChange?: (sections: { id: string; title: string }[]) => void;
 }) {
   const router = useRouter();
   const [title, setTitle] = useState(project.title);
@@ -411,8 +426,17 @@ export function WorkspaceEditor({
   // How many pages the draft currently runs to, so the sheet is that many
   // sheets tall and each one gets its number.
   const [pageCount, setPageCount] = useState(1);
+  // Where the "structural elements live in the outline" note is pinned, in
+  // sheet coordinates.
+  const [structureWarning, setStructureWarning] = useState<{ top: number } | null>(null);
 
   const editorRef = useRef<HTMLDivElement>(null);
+  // The sheet the draft is laid out on, so the warning can be placed against
+  // the element it concerns rather than the window.
+  const sheetRef = useRef<HTMLDivElement>(null);
+  // The warning clears itself after a moment, so its timer has to outlive the
+  // render that set it and be dropped when the workspace goes away.
+  const warningTimer = useRef<number | null>(null);
   // The column the numbers are painted in. A number is placed from this box, so
   // the gutter has to be measured rather than worked out from the page's margin.
   const gutterRef = useRef<HTMLDivElement>(null);
@@ -430,6 +454,9 @@ export function WorkspaceEditor({
   // is stashed on mousedown and put back before the value is applied. The chat
   // panel reuses it to know where an answer should land in the draft.
   const savedRange = useRef<Range | null>(null);
+  // The heading titles the draft last reported, so an edit is passed on once
+  // rather than on every keystroke that follows it.
+  const reportedTitles = useRef<Map<string, string>>(new Map());
 
   // What the database currently holds. Comparing against this rather than the
   // props lets the autosave settle without waiting for a server round trip.
@@ -480,6 +507,9 @@ export function WorkspaceEditor({
     const editor = editorRef.current;
     if (!editor) return;
     editor.innerHTML = initialContent.current;
+    // The titles the saved draft carries are the baseline: an edit is what
+    // differs from them, not the draft that was opened with them.
+    seedReportedTitles();
     // A saved draft can carry rows with nothing in them, which the reader never
     // saw and the caret can never reach. They are taken out as the draft is
     // read, so the writing below them can be moved back to the first line, and
@@ -504,6 +534,14 @@ export function WorkspaceEditor({
     return () => {
       observer.disconnect();
       window.removeEventListener("resize", remeasure);
+    };
+  }, []);
+
+  // The red note the delete guard raises clears itself, so its timer is dropped
+  // with the workspace rather than firing into a gone one.
+  useEffect(() => {
+    return () => {
+      if (warningTimer.current !== null) window.clearTimeout(warningTimer.current);
     };
   }, []);
 
@@ -855,12 +893,57 @@ export function WorkspaceEditor({
     element.addEventListener("pointercancel", onEnd);
   }
 
+  /** The heading titles the draft opened with, taken as the baseline so the
+   *  state it was opened in is not mistaken for an edit. */
+  function seedReportedTitles() {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const baseline = new Map<string, string>();
+    for (const heading of editor.querySelectorAll<HTMLElement>("[data-section-id]")) {
+      const id = heading.getAttribute("data-section-id");
+      if (id) baseline.set(id, (heading.textContent ?? "").trim());
+    }
+    reportedTitles.current = baseline;
+  }
+
+  /** Reads the heading titles the draft now carries and passes on the ones the
+   *  writer has changed, so the outline and the contents follow the prose. A
+   *  rename made from the outline moves the baseline with it, so it is not
+   *  echoed back to the outline as a fresh edit. */
+  function reportSectionTitles() {
+    const editor = editorRef.current;
+    const notify = onSectionTitlesChange;
+    if (!editor || !notify) return;
+
+    const baseline = reportedTitles.current;
+    const changed: { id: string; title: string }[] = [];
+    const present = new Set<string>();
+
+    for (const heading of editor.querySelectorAll<HTMLElement>("[data-section-id]")) {
+      const id = heading.getAttribute("data-section-id");
+      if (!id) continue;
+      present.add(id);
+      const title = (heading.textContent ?? "").trim();
+      if (baseline.get(id) !== title) {
+        baseline.set(id, title);
+        changed.push({ id, title });
+      }
+    }
+
+    // Only the outline takes a heading out; dropping it from the baseline means
+    // it is read as new if it is ever written back in.
+    for (const id of Array.from(baseline.keys())) if (!present.has(id)) baseline.delete(id);
+
+    if (changed.length > 0) notify(changed);
+  }
+
   function syncDraft() {
     setDraft(editorRef.current?.innerHTML ?? "");
     setStatus("idle");
     syncLineNumbers();
     syncPagination();
     syncSlider();
+    reportSectionTitles();
   }
 
   function runCommand(command?: string, value?: string) {
@@ -977,11 +1060,13 @@ export function WorkspaceEditor({
     }
   }
 
-  /** Drops raw HTML into the draft where the caret was last left. */
-  function insertHtmlAtCaret(html: string) {
+  /** Drops raw HTML into the draft where the caret was last left. `focus`
+   *  decides whether the draft takes the caret with it: restoring headings on
+   *  opening a project must not pull the writer out of the outline panel. */
+  function insertHtmlAtCaret(html: string, focus = true) {
     const editor = editorRef.current;
     if (!editor || html.trim() === "") return;
-    editor.focus();
+    if (focus) editor.focus();
 
     const selection = window.getSelection();
     const range = savedRange.current;
@@ -1053,17 +1138,24 @@ export function WorkspaceEditor({
     insertHtmlAtCaret(sectionBlockHtml(node));
   }
 
-  /** Adds headings for outline entries the draft does not carry yet. */
+  /** Adds headings for outline entries the draft does not carry yet, so every
+   *  element the outline holds is present in the draft. The additions are
+   *  appended and then the draft is put back into outline order, so a restored
+   *  element lands where its role belongs rather than at the end. */
   function insertMissingSections(nodes: StructureNode[]) {
     const missing = nodes.filter((node) => !findSection(node.id));
     if (missing.length === 0) return;
-    insertHtmlAtCaret(missing.map(sectionBlockHtml).join(""));
+    insertHtmlAtCaret(missing.map(sectionBlockHtml).join(""), false);
+    reorderSections(nodes.map((node) => node.id));
   }
 
   function renameSection(id: string, title: string) {
     const heading = findSection(id);
     if (!heading) return;
     heading.textContent = title;
+    // This rename came from the outline, so it is not an edit of the prose to
+    // be passed back; the baseline is moved with it.
+    reportedTitles.current.set(id, title.trim());
     syncDraft();
   }
 
@@ -1153,6 +1245,103 @@ export function WorkspaceEditor({
     selection.removeAllRanges();
     selection.addRange(range);
     savedRange.current = range.cloneRange();
+  }
+
+  /** The structural element a node sits in, if any: the heading the outline
+   *  owns rather than the prose the writer put under it. */
+  function structuralAncestor(node: Node | null): HTMLElement | null {
+    const editor = editorRef.current;
+    let element: HTMLElement | null =
+      node instanceof HTMLElement ? node : (node?.parentElement ?? null);
+    while (element && element !== editor) {
+      if (element.hasAttribute("data-section-id")) return element;
+      element = element.parentElement;
+    }
+    return null;
+  }
+
+  /** Whether the caret sits before every word of a heading. */
+  function caretAtStart(heading: HTMLElement, range: Range): boolean {
+    const before = document.createRange();
+    before.selectNodeContents(heading);
+    before.setEnd(range.startContainer, range.startOffset);
+    return before.toString() === "";
+  }
+
+  /** Whether the caret sits after every word of a heading. */
+  function caretAtEnd(heading: HTMLElement, range: Range): boolean {
+    const after = document.createRange();
+    after.selectNodeContents(heading);
+    after.setStart(range.endContainer, range.endOffset);
+    return after.toString() === "";
+  }
+
+  /** Pins the red note to a structural element, so the writer is told where the
+   *  element they tried to delete here has to be deleted from instead. */
+  function showStructureWarning(heading: HTMLElement) {
+    const sheet = sheetRef.current;
+    if (warningTimer.current !== null) window.clearTimeout(warningTimer.current);
+    setStructureWarning({
+      top: sheet ? heading.getBoundingClientRect().top - sheet.getBoundingClientRect().top : 0,
+    });
+    warningTimer.current = window.setTimeout(() => setStructureWarning(null), 3200);
+  }
+
+  /**
+   * Structural elements belong to the outline, so the draft refuses to take one
+   * out. A deletion that would remove a heading — a selection across it, a
+   * backspace into it, a delete through the one after it — is stopped and the
+   * writer is pointed back at the outline panel.
+   */
+  function guardStructuralDelete(event: ReactKeyboardEvent<HTMLDivElement>) {
+    // Cut is a deletion too, so it is held to the same rule as the keys.
+    const isCut = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "x";
+    if (!isCut && event.key !== "Backspace" && event.key !== "Delete") return;
+    const editor = editorRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection || selection.rangeCount === 0) return;
+    const range = selection.getRangeAt(0);
+
+    // A selection that spans out of a heading takes the element with it; words
+    // chosen inside a single heading are only an edit of its text, which leaves
+    // the element — and its placeholder — in place.
+    if (!range.collapsed) {
+      const startHeading = structuralAncestor(range.startContainer);
+      const endHeading = structuralAncestor(range.endContainer);
+      if (startHeading && startHeading === endHeading) return;
+      const hit = Array.from(editor.querySelectorAll<HTMLElement>("[data-section-id]")).find(
+        (heading) => range.intersectsNode(heading),
+      );
+      if (hit) {
+        event.preventDefault();
+        showStructureWarning(hit);
+      }
+      return;
+    }
+
+    // A cut always carries a selection, so a collapsed caret has nothing to do.
+    if (isCut) return;
+
+    const heading = structuralAncestor(range.startContainer);
+    if (!heading) return;
+
+    // Backspace at the head of a heading folds it into what precedes it, which
+    // is how a heading loses its own tag; delete at its tail swallows the
+    // heading after it.
+    if (event.key === "Backspace" && heading.previousSibling && caretAtStart(heading, range)) {
+      event.preventDefault();
+      showStructureWarning(heading);
+      return;
+    }
+    if (
+      event.key === "Delete" &&
+      heading.nextSibling instanceof Element &&
+      heading.nextSibling.hasAttribute("data-section-id") &&
+      caretAtEnd(heading, range)
+    ) {
+      event.preventDefault();
+      showStructureWarning(heading);
+    }
   }
 
   useImperativeHandle(ref, () => ({
@@ -1480,6 +1669,7 @@ export function WorkspaceEditor({
                     the whole run of pages, so the page numbers below land on the
                     page they belong to. */}
                 <div
+                  ref={sheetRef}
                   className="relative shrink-0 rounded-sm border border-black/[.08] bg-white shadow-sm dark:border-white/[.12] dark:bg-zinc-900"
                   style={{
                     width: pageSize.width,
@@ -1507,6 +1697,19 @@ export function WorkspaceEditor({
                     </span>
                   ))}
 
+                  {/* Raised when a structural element is deleted from the draft:
+                      it lives in the outline, so the writer is told to remove it
+                      there instead. */}
+                  {structureWarning && (
+                    <div
+                      role="alert"
+                      className="pointer-events-none absolute right-2 z-10 rounded-md bg-red-600 px-2 py-1 text-xs font-medium text-white shadow dark:bg-red-500"
+                      style={{ top: structureWarning.top }}
+                    >
+                      Can be deleted in outline panel only
+                    </div>
+                  )}
+
                   <div
                     ref={editorRef}
                     contentEditable
@@ -1518,11 +1721,14 @@ export function WorkspaceEditor({
                     // A paste is rebuilt as draft rows before it lands, so it
                     // cannot bring in lines the numbering does not count.
                     onPaste={handlePaste}
+                    // A structural element is the outline's to remove, so the
+                    // deletion keys are held back before they can take one out.
+                    onKeyDown={guardStructuralDelete}
                     // The chat panel inserts at this caret, so it is refreshed every
                     // time the user moves it inside the draft.
                     onKeyUp={rememberSelection}
                     onMouseUp={rememberSelection}
-                    className="text-base leading-7 outline-none empty:before:text-zinc-400 empty:before:content-[attr(data-placeholder)] [&_h1]:mt-4 [&_h1]:mb-2 [&_h1]:text-2xl [&_h1]:font-semibold [&_h2]:mt-4 [&_h2]:mb-2 [&_h2]:text-xl [&_h2]:font-semibold [&_h3]:mt-3 [&_h3]:mb-1 [&_h3]:text-lg [&_h3]:font-semibold [&_hr]:my-4 [&_hr]:border-t [&_hr]:border-zinc-300 dark:[&_hr]:border-zinc-700 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-6 [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-6 [&_p]:my-2"
+                    className="text-base leading-7 outline-none empty:before:text-zinc-400 empty:before:content-[attr(data-placeholder)] [&_[data-section-id]:empty]:before:font-normal [&_[data-section-id]:empty]:before:text-zinc-400 [&_[data-section-id]:empty]:before:content-[attr(data-placeholder)] [&_h1]:mt-4 [&_h1]:mb-2 [&_h1]:text-2xl [&_h1]:font-semibold [&_h2]:mt-4 [&_h2]:mb-2 [&_h2]:text-xl [&_h2]:font-semibold [&_h3]:mt-3 [&_h3]:mb-1 [&_h3]:text-lg [&_h3]:font-semibold [&_h4]:mt-2 [&_h4]:mb-1 [&_h4]:text-base [&_h4]:font-semibold [&_hr]:my-4 [&_hr]:border-t [&_hr]:border-zinc-300 dark:[&_hr]:border-zinc-700 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-6 [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-6 [&_p]:my-2"
                   />
                 </div>
               </div>

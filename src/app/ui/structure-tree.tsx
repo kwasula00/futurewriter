@@ -10,6 +10,7 @@ import {
   WORK_TYPES,
   WORK_TYPE_META,
   defaultNodeTitle,
+  isPositionLocked,
   newNodeId,
   type MoveDirection,
   type Structure,
@@ -95,6 +96,10 @@ export function StructureTree({
   const [draftTitle, setDraftTitle] = useState("");
   // Folders the writer has shut; everything else shows its children.
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // A container whose + was pressed and is now asking which kind of child to
+  // add. Nothing is nested until that choice is made, so a chapter never grows
+  // a subchapter on its own.
+  const [pickingChild, setPickingChild] = useState<string | null>(null);
 
   // A type change can leave the picker on a role the new type does not offer, so
   // the picker reads the first role the current type does offer instead.
@@ -141,7 +146,7 @@ export function StructureTree({
     onAdd({
       id: newNodeId(),
       kind: newKind,
-      title: text !== "" ? text : defaultNodeTitle(newKind, structure.nodes, null),
+      title: text !== "" ? text : defaultNodeTitle(newKind),
       parentId: null,
     });
     setCustomText("");
@@ -151,7 +156,7 @@ export function StructureTree({
     onAdd({
       id: newNodeId(),
       kind,
-      title: defaultNodeTitle(kind, structure.nodes, parent.id),
+      title: defaultNodeTitle(kind),
       parentId: parent.id,
     });
   }
@@ -184,8 +189,11 @@ export function StructureTree({
         )}
 
         {rows.map(({ node, depth, childCount, canMoveUp, canMoveDown }) => {
-          const childKind = CHILD_KINDS[node.kind];
+          const childKinds = CHILD_KINDS[node.kind] ?? [];
           const isCollapsed = collapsed.has(node.id);
+          // A prologue or epilogue only belongs at one end of the book, so it
+          // does not travel among its siblings.
+          const locked = isPositionLocked(node.kind);
 
           return (
             <li key={node.id} className="flex items-center gap-1" style={{ paddingLeft: depth * 10 }}>
@@ -237,9 +245,9 @@ export function StructureTree({
               <button
                 type="button"
                 onClick={() => onMove(node.id, "up")}
-                disabled={!canMoveUp}
+                disabled={locked || !canMoveUp}
                 aria-label={`Move ${node.title} up`}
-                title="Move up"
+                title={locked ? "This element keeps its place" : "Move up"}
                 className={`${iconButtonClass} px-1 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent`}
               >
                 ↑
@@ -247,24 +255,64 @@ export function StructureTree({
               <button
                 type="button"
                 onClick={() => onMove(node.id, "down")}
-                disabled={!canMoveDown}
+                disabled={locked || !canMoveDown}
                 aria-label={`Move ${node.title} down`}
-                title="Move down"
+                title={locked ? "This element keeps its place" : "Move down"}
                 className={`${iconButtonClass} px-1 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent`}
               >
                 ↓
               </button>
-              {childKind && (
+              {/* Nesting is optional: a container only grows a child when the
+                  writer asks for one. One kind of child is added straight away;
+                  where more than one fits, the + asks which. */}
+              {childKinds.length === 1 && (
                 <button
                   type="button"
-                  onClick={() => addChild(node, childKind)}
-                  aria-label={`Add ${KIND_META[childKind].label} inside ${node.title}`}
-                  title={`Add ${KIND_META[childKind].label}`}
+                  onClick={() => addChild(node, childKinds[0])}
+                  aria-label={`Add ${KIND_META[childKinds[0]].label} inside ${node.title}`}
+                  title={`Add ${KIND_META[childKinds[0]].label}`}
                   className={iconButtonClass}
                 >
                   +
                 </button>
               )}
+              {childKinds.length > 1 &&
+                (pickingChild === node.id ? (
+                  <select
+                    autoFocus
+                    value=""
+                    onChange={(event) => {
+                      addChild(node, event.target.value as StructureKind);
+                      setPickingChild(null);
+                    }}
+                    onBlur={() => window.setTimeout(() => setPickingChild(null), 0)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") setPickingChild(null);
+                    }}
+                    aria-label={`Kind of element to add inside ${node.title}`}
+                    title="Kind of element to add"
+                    className="rounded border border-black/[.15] bg-transparent px-1 py-0.5 text-[10px] outline-none dark:border-white/[.2]"
+                  >
+                    <option value="" disabled>
+                      Add…
+                    </option>
+                    {childKinds.map((kind) => (
+                      <option key={kind} value={kind}>
+                        {KIND_META[kind].label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setPickingChild(node.id)}
+                    aria-label={`Add an element inside ${node.title}`}
+                    title="Add an element inside"
+                    className={iconButtonClass}
+                  >
+                    +
+                  </button>
+                ))}
               <button
                 type="button"
                 onClick={() => onRemove(node.id)}
