@@ -21,7 +21,7 @@ export default async function LoginPage({
         className="pointer-events-none absolute inset-0 bg-[url('/front-page-image.jpg')] bg-cover bg-center bg-no-repeat"
       />
 
-      <div className="relative w-full max-w-md rounded-2xl bg-white p-8">
+      <div className="relative w-full max-w-md rounded-2xl bg-white p-8 shadow-xl">
         <Link href="/" className="text-sm font-semibold tracking-tight">
           FutureWriter
         </Link>
