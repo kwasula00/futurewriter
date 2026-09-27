@@ -27,7 +27,7 @@ export default async function LoginPage({
         </Link>
 
         <h1 className="mt-6 text-2xl font-semibold tracking-tight text-zinc-950">Log in</h1>
-        <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
+        <p className="mt-2 text-sm text-zinc-600">
           Welcome back. Pick up where you left off.
         </p>
 
@@ -39,7 +39,7 @@ export default async function LoginPage({
 
         <LoginForm />
 
-        <p className="mt-6 text-sm text-zinc-600 dark:text-zinc-400">
+        <p className="mt-6 text-sm text-zinc-600">
           New to FutureWriter?{" "}
           <Link href="/signup" className="font-medium text-zinc-950 underline dark:text-zinc-50">
             Create an account
